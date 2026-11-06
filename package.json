@@ -36,5 +36,11 @@
   "bugs": {
     "url": "https://github.com/SimoneB79/nodered-mcp-full/issues"
   },
-  "author": "Simone Bonizzardi"
+  "author": "Simone Bonizzardi",
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ]
 }
