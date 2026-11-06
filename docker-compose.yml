@@ -1,0 +1,16 @@
+# Example: run nodered-mcp-full as a standalone container
+services:
+  nodered-mcp:
+    build: .
+    restart: unless-stopped
+    environment:
+      NODE_RED_URL: http://host.docker.internal:1880   # or https://nodered.example.lan
+      # NODE_RED_TOKEN: your-adminauth-token
+      # NODE_RED_CA_FILE: /certs/ca.crt
+      # NODE_RED_READ_ONLY: "true"
+      NODE_RED_BACKUP_DIR: /data/backups
+    volumes:
+      - ./backups:/data/backups
+      # - ./certs:/certs:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "nodered": {
+      "command": "npx",
+      "args": ["-y", "nodered-mcp-full"],
+      "env": {
+        "NODE_RED_URL": "http://localhost:1880"
+      }
+    }
+  }
+}

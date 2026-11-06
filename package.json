@@ -1,0 +1,40 @@
+{
+  "name": "nodered-mcp-full",
+  "version": "0.1.0",
+  "description": "Full-featured MCP server for Node-RED: complete admin-API access for AI agents — read AND safe write (confirm + automatic backups + restore), env-driven for any setup: direct, reverse proxy with custom CA, adminAuth token, read-only mode.",
+  "type": "module",
+  "bin": {
+    "nodered-mcp-full": "index.js"
+  },
+  "main": "index.js",
+  "keywords": [
+    "mcp",
+    "node-red",
+    "model-context-protocol",
+    "flows",
+    "automation",
+    "ai",
+    "claude",
+    "openclaw"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.0"
+  },
+  "scripts": {
+    "test": "node test/e2e.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SimoneB79/nodered-mcp-full.git"
+  },
+  "homepage": "https://github.com/SimoneB79/nodered-mcp-full#readme",
+  "bugs": {
+    "url": "https://github.com/SimoneB79/nodered-mcp-full/issues"
+  },
+  "author": "Simone Bonizzardi"
+}

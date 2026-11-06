@@ -1,0 +1,11 @@
+{
+  "nodered": {
+    "command": "node",
+    "args": ["/config/nodered-mcp/index.js"],
+    "env": {
+      "NODE_RED_URL": "https://nodered.lan",
+      "NODE_RED_CA_FILE": "/usr/local/share/ca-certificates/caddy-root-ca.crt",
+      "NODE_RED_BACKUP_DIR": "/config/nodered-mcp/backups"
+    }
+  }
+}
