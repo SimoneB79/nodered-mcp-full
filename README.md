@@ -34,7 +34,8 @@ Built for real-world setups:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NODE_RED_URL` | `http://localhost:1880` | Base URL of the editor/admin API (no trailing slash) |
-| `NODE_RED_TOKEN` | — | Bearer token when Node-RED `adminAuth` is enabled |
+| `NODE_RED_TOKEN` | — | Static bearer token (if you manage tokens yourself) |
+| `NODE_RED_USER` / `NODE_RED_PASS` | — | **Recommended with adminAuth**: the server logs in automatically (`POST /auth/token`), caches and renews the token |
 | `NODE_RED_CA_FILE` | — | Path to a CA certificate file for HTTPS behind a private reverse proxy |
 | `NODE_RED_INSECURE_TLS` | `false` | Skip TLS verification (self-signed, testing only) |
 | `NODE_RED_READ_ONLY` | `false` | Disable every write tool |
