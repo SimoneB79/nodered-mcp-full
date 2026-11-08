@@ -1,6 +1,6 @@
 {
   "name": "nodered-mcp-full",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Full-featured MCP server for Node-RED: complete admin-API access for AI agents — read AND safe write (confirm + automatic backups + restore), env-driven for any setup: direct, reverse proxy with custom CA, adminAuth token, read-only mode.",
   "type": "module",
   "bin": {
