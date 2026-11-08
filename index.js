@@ -22,6 +22,8 @@ import os from "node:os";
 // ---------------- environment ----------------
 const URL_BASE = (process.env.NODE_RED_URL || "http://localhost:1880").replace(/\/+$/, "");
 const TOKEN = process.env.NODE_RED_TOKEN || "";
+const AUTH_USER = process.env.NODE_RED_USER || "";
+const AUTH_PASS = process.env.NODE_RED_PASS || "";
 const CA_FILE = process.env.NODE_RED_CA_FILE || "";
 const INSECURE_TLS = process.env.NODE_RED_INSECURE_TLS === "true";
 const READ_ONLY = process.env.NODE_RED_READ_ONLY === "true";
@@ -38,15 +40,42 @@ if (CA_FILE) {
   catch (e) { console.error("nodered-mcp: cannot read NODE_RED_CA_FILE: " + CA_FILE); process.exit(1); }
 }
 
+// ---------------- auth token (auto login + cache) ----------------
+let cachedToken = null, tokenExp = 0;
+async function getToken(force) {
+  if (!AUTH_USER) return TOKEN;
+  const now = Date.now();
+  if (!force && cachedToken && now < tokenExp - 60000) return cachedToken;
+  return new Promise((resolve, reject) => {
+    let u;
+    try { u = new URL(URL_BASE + "/auth/token"); } catch (e) { reject(e); return; }
+    const mod = u.protocol === "https:" ? https : http;
+    const form = new URLSearchParams({ client_id: "node-red-editor", grant_type: "password", scope: "*", username: AUTH_USER, password: AUTH_PASS }).toString();
+    const req = mod.request({ hostname: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80), path: u.pathname, method: "POST", headers: Object.assign({}, EXTRA_HEADERS, { "Content-Type": "application/x-www-form-urlencoded", "Content-Length": Buffer.byteLength(form) }), ca: ca || undefined, rejectUnauthorized: !INSECURE_TLS }, (res) => {
+      let data = ""; res.setEncoding("utf8");
+      res.on("data", c => data += c);
+      res.on("end", () => {
+        if (res.statusCode !== 200) { reject(new Error("auth login failed HTTP " + res.statusCode)); return; }
+        try { const j = JSON.parse(data); cachedToken = j.access_token; tokenExp = now + (j.expires_in || 604800) * 1000; resolve(cachedToken); }
+        catch (e) { reject(new Error("auth login: bad response")); }
+      });
+    });
+    req.setTimeout(TIMEOUT_MS, () => req.destroy(new Error("auth login timeout")));
+    req.on("error", reject);
+    req.write(form); req.end();
+  });
+}
+
 // ---------------- http client ----------------
-function request(method, urlPath, body, extraHeaders) {
+async function request(method, urlPath, body, extraHeaders) {
+  const tk = await getToken(false);
   return new Promise((resolve, reject) => {
     let u;
     try { u = new URL(URL_BASE + urlPath); }
     catch (e) { reject(new Error("invalid path or base URL")); return; }
     const mod = u.protocol === "https:" ? https : http;
     const headers = Object.assign({}, EXTRA_HEADERS, extraHeaders || {}, { Accept: "application/json" });
-    if (TOKEN) headers.Authorization = "Bearer " + TOKEN;
+    if (tk) headers.Authorization = "Bearer " + tk;
     let payload;
     if (body !== undefined) { payload = JSON.stringify(body); headers["Content-Type"] = "application/json"; headers["Content-Length"] = Buffer.byteLength(payload); }
     const req = mod.request({
@@ -71,7 +100,8 @@ function request(method, urlPath, body, extraHeaders) {
 }
 
 async function apiGet(p) {
-  const r = await request("GET", p);
+  let r = await request("GET", p);
+  if (r.status === 401 && AUTH_USER) { await getToken(true); r = await request("GET", p); }
   if (r.status !== 200) throw new Error("GET " + p + " -> HTTP " + r.status + ": " + r.body.slice(0, 400));
   return r.body;
 }
@@ -108,7 +138,8 @@ async function backupFlows(label) {
 // ---------------- deploy (full, the safe way) ----------------
 async function deployFlows(flows) {
   const backup = await backupFlows("pre-deploy");
-  const r = await request("POST", "/flows", flows, { "Node-RED-Deployment-Type": "flows" });
+  let r = await request("POST", "/flows", flows, { "Node-RED-Deployment-Type": "flows" });
+  if (r.status === 401 && AUTH_USER) { await getToken(true); r = await request("POST", "/flows", flows, { "Node-RED-Deployment-Type": "flows" }); }
   if (r.status !== 204 && r.status !== 200) {
     throw new Error("deploy failed HTTP " + r.status + " (backup kept: " + backup + "): " + r.body.slice(0, 400));
   }
