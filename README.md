@@ -32,6 +32,7 @@ Built for real-world setups:
 | `validate_flows` | Validate a candidate flow array without deploying (dup ids, dangling wires, legacy HA v3 fields, `flow.get(...,'file')` traps) |
 | `deploy_flows` | Deploy a complete flow array — `dry_run` validation, auto backup, needs `confirm:true` |
 | `call_endpoint` | GET any HTTP endpoint served by your flows (custom diagnostics, APIs) |
+| `get_errors` | **Live runtime errors/warnings**: red/yellow node statuses + error notifications from the editor comms channel, node and tab resolved - no SSH needed |
 | `list_backups` | List automatic pre-deploy backups |
 | `restore_backup` | Restore a backup in one command — needs `confirm:true` |
 | `list_node_types` | Installed palette modules and node types |

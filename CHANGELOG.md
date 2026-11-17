@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.4.0 (2026-11-17)
+- get_errors: live runtime error monitor via the editor /comms websocket (auth-packet login, status + notification subscriptions, auto-reconnect, heartbeat echo). Rolling 500-event buffer of red/yellow node statuses and error notifications with node name/type/tab resolved; filters: limit, tab_id, include_warnings, clear. No more SSH/docker to read why a node is in error.
+
 ## 0.3.0 (2026-11-17)
 - AI-first comprehension layer: get_flow_map (outline / mermaid / json, wiring resolved to node names), list_flows detail:true (type histogram, entry points, config refs, subflow instances), search_nodes (fields + function code), list_config_nodes (usage counts)
 - Surgical writes: patch_batch (one deploy for many patches), upsert_node (auto id/position, optional wire_from), delete_node (+splice bypass) - the model sends only diffs, the server merges and deploys the full array

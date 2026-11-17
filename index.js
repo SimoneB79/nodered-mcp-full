@@ -2,6 +2,8 @@
 /**
  * nodered-mcp-full - MCP server for the Node-RED Admin API
  *
+ * v0.4.0 - get_errors: live runtime error monitor via the editor /comms websocket
+ *          (red/yellow node statuses + error notifications, node/tab resolved)
  * v0.3.0 - AI-first flow comprehension layer:
  *   - get_flow_map: tab/subflow rendered as outline or Mermaid, wiring resolved to names
  *   - list_flows detail, search_nodes, list_config_nodes
@@ -26,6 +28,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
+import WebSocket from "ws";
 
 // ---------------- environment ----------------
 const URL_BASE = (process.env.NODE_RED_URL || "http://localhost:1880").replace(/\/+$/, "");
@@ -72,6 +75,107 @@ async function getToken(force) {
     req.on("error", reject);
     req.write(form); req.end();
   });
+}
+
+// ---------------- runtime error monitor (editor comms websocket) ----------------
+// Connects to the same /comms websocket the Node-RED editor uses, authenticates
+// with the admin token (auth packet), subscribes to status + notification and
+// keeps a rolling buffer of red/yellow node statuses and error notifications.
+const MONITOR_MAX = 500;
+const monitor = { ws: null, state: "idle", since: null, buffer: [], lastFill: new Map(), reconnectMs: 4000, reconnectTimer: null, closedByUs: false };
+let nodeNames = null; let nodeNamesAt = 0;
+
+function monitorRecord(kind, entry) {
+  monitor.buffer.push(Object.assign({ ts: Date.now(), kind }, entry));
+  if (monitor.buffer.length > MONITOR_MAX) monitor.buffer.splice(0, monitor.buffer.length - MONITOR_MAX);
+}
+
+async function nodeNameMap() {
+  if (nodeNames && Date.now() - nodeNamesAt < 60000) return nodeNames;
+  try {
+    const flows = await apiGetJson("/flows");
+    const tabs = new Map();
+    flows.forEach(function (f) { if (f.type === "tab") tabs.set(f.id, f.label || f.id); });
+    const map = new Map();
+    flows.forEach(function (f) {
+      if (f.type === "tab" || f.type === "subflow") return;
+      map.set(f.id, { name: f.name || f.type || f.id, type: f.type, tab_id: f.z || null, tab_label: f.z ? (tabs.get(f.z) || f.z) : "(config)" });
+    });
+    nodeNames = { map: map }; nodeNamesAt = Date.now();
+    return nodeNames;
+  } catch (e) { return nodeNames || { map: new Map() }; }
+}
+
+function monitorConnect() {
+  if (monitor.ws && (monitor.ws.readyState === 0 || monitor.ws.readyState === 1)) return;
+  monitor.closedByUs = false;
+  monitor.state = "connecting";
+  const wsUrl = URL_BASE.replace(/^http/, "ws") + "/comms";
+  let ws;
+  try { ws = new WebSocket(wsUrl, { headers: Object.assign({}, EXTRA_HEADERS), ca: ca || undefined, rejectUnauthorized: !INSECURE_TLS }); }
+  catch (e) { monitor.state = "error: " + e.message; scheduleReconnect(); return; }
+  ws.on("open", async function () {
+    monitor.ws = ws;
+    monitor.state = "authorizing";
+    try {
+      const t = AUTH_USER ? await getToken() : (TOKEN || "");
+      ws.send(JSON.stringify({ auth: t || "" }));
+    } catch (e) { monitor.state = "auth-error"; monitor.closedByUs = true; try { ws.close(); } catch (e2) {} }
+  });
+  ws.on("message", function (raw) {
+    let m; try { m = JSON.parse(raw.toString()); } catch (e) { return; }
+    if (m && m.auth) {
+      if (m.auth === "ok") {
+        monitor.state = "open"; monitor.since = Date.now();
+        try { ws.send(JSON.stringify({ subscribe: "status" })); ws.send(JSON.stringify({ subscribe: "notification" })); } catch (e) {}
+      } else { monitor.state = "auth-fail"; monitor.closedByUs = true; try { ws.close(); } catch (e) {} }
+      return;
+    }
+    const arr = Array.isArray(m) ? m : [m];
+    for (const one of arr) {
+      if (!one || typeof one !== "object") continue;
+      const topic = String(one.topic || "");
+      if (topic === "hb") { try { ws.send(JSON.stringify({ topic: "hb" })); } catch (e) {} continue; }
+      if (topic.indexOf("status/") === 0) {
+        const id = topic.slice(7);
+        const d = one.data || {};
+        if (d.fill) monitor.lastFill.set(id, d.fill);
+        if (d.fill === "red" || d.fill === "yellow") monitorRecord("status", { node_id: id, fill: d.fill, shape: d.shape || null, text: String(d.text || "") });
+        continue;
+      }
+      if (topic.indexOf("notification/") === 0) {
+        const d = one.data || {};
+        if (d && (d.type === "error" || d.type === "warning")) monitorRecord("notification", { level: d.type, text: String(d.text || "") });
+        continue;
+      }
+    }
+  });
+  ws.on("close", function () {
+    if (monitor.ws === ws) {
+      monitor.ws = null;
+      if (!monitor.closedByUs) { monitor.state = "reconnect-wait"; scheduleReconnect(); }
+      else monitor.state = "closed";
+    }
+  });
+  ws.on("error", function () { /* close handler reschedules */ });
+}
+
+function scheduleReconnect() {
+  if (monitor.reconnectTimer) return;
+  monitor.reconnectTimer = setTimeout(function () { monitor.reconnectTimer = null; monitorConnect(); }, monitor.reconnectMs);
+}
+
+async function ensureMonitor() {
+  if (monitor.ws && monitor.ws.readyState === 1) return;
+  if (monitor.ws && monitor.ws.readyState === 0) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 3000 && monitor.state !== "open") await new Promise(function (r) { setTimeout(r, 100); });
+    return;
+  }
+  if (AUTH_USER) { try { await getToken(true); } catch (e) { /* proceed, auth packet will fail visibly */ } }
+  monitorConnect();
+  const t0 = Date.now();
+  while (Date.now() - t0 < 4000 && monitor.state !== "open") await new Promise(function (r) { setTimeout(r, 100); });
 }
 
 // ---------------- http client ----------------
@@ -401,7 +505,7 @@ function removeNode(flows, nodeId) {
 }
 
 // ---------------- server ----------------
-const server = new McpServer({ name: "nodered-mcp", version: "0.3.0" });
+const server = new McpServer({ name: "nodered-mcp", version: "0.4.0" });
 const log = (msg) => console.error("[nodered-mcp] " + msg);
 log("target " + URL_BASE + (TOKEN ? " (token)" : "") + (READ_ONLY ? " READ-ONLY" : ""));
 
@@ -650,5 +754,44 @@ server.tool("list_node_types", "List installed palette modules and node types", 
   return { content: [{ type: "text", text: txt(nodes.map(m => ({ module: m.module, version: m.version, types: m.types, local: m.local, disabled: m.disabled }))) }] };
 });
 
+server.tool("get_errors", "Live runtime errors and warnings from the Node-RED editor comms channel: node statuses with red/yellow fill (e.g. 'Call-service error...', rejected commands) and runtime error notifications, with node name/type/tab resolved. The monitor connects on first call and keeps a rolling in-memory buffer (reconnects automatically); events are captured from the moment it first connects - there is no history before that. include_warnings:false hides yellow; tab_id filters one tab; clear:true empties the buffer after reading.", {
+  limit: z.number().int().min(1).max(200).optional(),
+  tab_id: z.string().optional(),
+  include_warnings: z.boolean().optional(),
+  clear: z.boolean().optional()
+}, async ({ limit, tab_id, include_warnings, clear }) => {
+  await ensureMonitor();
+  const names = await nodeNameMap();
+  const wanted = limit || 30;
+  let seen = 0;
+  const entries = [];
+  const reversed = monitor.buffer.slice().reverse();
+  for (const e of reversed) {
+    if (entries.length >= wanted) break;
+    const isWarn = (e.kind === "status" && e.fill === "yellow") || (e.kind === "notification" && e.level === "warning");
+    if (include_warnings === false && isWarn) continue;
+    const info = e.node_id ? names.map.get(e.node_id) : null;
+    if (tab_id && (!info || (info.tab_id !== tab_id && info.tab_label !== tab_id))) continue;
+    entries.push({
+      time: new Date(e.ts).toISOString(),
+      kind: e.kind,
+      node_id: e.node_id || undefined,
+      node: info ? info.name : undefined,
+      node_type: info ? info.type : undefined,
+      tab: info ? info.tab_label : undefined,
+      fill: e.fill || undefined,
+      level: e.level || undefined,
+      still_current: e.kind === "status" ? monitor.lastFill.get(e.node_id) === e.fill : undefined,
+      text: e.text
+    });
+  }
+  if (clear) monitor.buffer.length = 0;
+  const out = {
+    monitor: { state: monitor.state, connected_since: monitor.since ? new Date(monitor.since).toISOString() : null, captured_events: monitor.buffer.length },
+    errors: entries
+  };
+  return { content: [{ type: "text", text: txt(out) }] };
+});
+
 await server.connect(new StdioServerTransport());
-log("ready: 17 tools (v0.3.0)");
+log("ready: 18 tools (v0.4.0)");

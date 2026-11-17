@@ -1,6 +1,7 @@
 // End-to-end test: spawns the MCP server against a mock Node-RED Admin API.
 // No external dependencies: run with "npm test".
 import http from "node:http";
+import { WebSocketServer } from "ws";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -38,6 +39,29 @@ const srv = http.createServer((req, res) => {
   else if (req.method === "GET" && url === "/diag") { res.end("diag-ok"); }
   else { res.statusCode = 404; res.end("{}"); }
 });
+// ---- mock editor /comms websocket ----
+const wss = new WebSocketServer({ noServer: true });
+let commsEvents = 0;
+srv.on("upgrade", (req, socket, head) => {
+  const u = new URL(req.url, "http://x");
+  if (u.pathname !== "/comms") { socket.destroy(); return; }
+  wss.handleUpgrade(req, socket, head, ws => {
+    ws.on("message", raw => {
+      let m; try { m = JSON.parse(raw.toString()); } catch { return; }
+      if (m.auth !== undefined) { ws.send(JSON.stringify({ auth: "ok" })); return; }
+      if (m.topic === "hb") { ws.send(JSON.stringify({ topic: "hb" })); return; }
+      if (m.subscribe === "status") {
+        setTimeout(() => {
+          ws.send(JSON.stringify({ topic: "status/n1", data: { fill: "red", shape: "ring", text: "Call-service error. boom" } }));
+          ws.send(JSON.stringify({ topic: "status/n2", data: { fill: "yellow", shape: "ring", text: "warn status" } }));
+          ws.send(JSON.stringify({ topic: "notification/mock", data: { type: "error", text: "mock notif error" } }));
+          commsEvents++;
+        }, 150);
+      }
+    });
+  });
+});
+
 await new Promise(r => srv.listen(PORT, r));
 
 // ---- spawn MCP server ----
@@ -71,7 +95,7 @@ try {
   child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
 
   const tools = await call("tools/list", {});
-  check("17 tools", tools.result.tools.length === 17);
+  check("18 tools", tools.result.tools.length === 18);
 
   // --- overview + comprehension ---
   const lf = await tool("list_flows", {});
@@ -162,10 +186,25 @@ try {
   check("call_endpoint", text(ce).includes("diag-ok"));
   const nt = await tool("list_node_types", {});
   check("list_node_types", j(nt)[0].module === "node-red");
+
+  // --- get_errors: comms monitor ---
+  const ge0 = await tool("get_errors", {}); // avvia il monitor
+  await new Promise(r => setTimeout(r, 900)); // attende status/invii del mock
+  const ge = await tool("get_errors", {});
+  const gej = j(ge);
+  check("get_errors monitor open", gej.monitor.state === "open" && typeof gej.monitor.connected_since === "string");
+  const errN1 = gej.errors.find(x => x.node_id === "n1");
+  check("get_errors red status captured", errN1 && errN1.fill === "red" && errN1.text.includes("boom") && errN1.tab === "Demo" && errN1.still_current === true);
+  check("get_errors notification captured", gej.errors.some(x => x.kind === "notification" && x.text.includes("mock notif")));
+  const gw = await tool("get_errors", { include_warnings: false });
+  check("get_errors warnings filtered", j(gw).errors.every(x => x.fill !== "yellow"));
+  const gc = await tool("get_errors", { clear: true });
+  const gAfter = await tool("get_errors", {});
+  check("get_errors clear empties buffer", j(gAfter).errors.length === 0);
 } catch (e) {
   console.log("FAIL - unexpected:", e.message); failures++;
 } finally {
-  child.kill(); srv.close();
+  child.kill(); srv.close(); try { wss.close(); } catch {}
 }
 console.log(failures === 0 ? "\nALL TESTS PASSED" : "\n" + failures + " FAILURES");
 process.exit(failures === 0 ? 0 : 1);
