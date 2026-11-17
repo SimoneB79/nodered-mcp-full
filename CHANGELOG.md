@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.4.1 (2026-11-17)
+- get_errors: include_last_status:true adds nodes_in_error_now (nodes whose latest status is red) and last_status_seen (latest status per node seen by the monitor). Verified against real Node-RED: the comms channel has NO status replay on subscribe, so silent nodes appear only after they emit again.
+
 ## 0.4.0 (2026-11-17)
 - get_errors: live runtime error monitor via the editor /comms websocket (auth-packet login, status + notification subscriptions, auto-reconnect, heartbeat echo). Rolling 500-event buffer of red/yellow node statuses and error notifications with node name/type/tab resolved; filters: limit, tab_id, include_warnings, clear. No more SSH/docker to read why a node is in error.
 

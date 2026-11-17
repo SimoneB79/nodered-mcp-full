@@ -201,6 +201,12 @@ try {
   const gc = await tool("get_errors", { clear: true });
   const gAfter = await tool("get_errors", {});
   check("get_errors clear empties buffer", j(gAfter).errors.length === 0);
+
+  // --- get_errors include_last_status ---
+  const gl = await tool("get_errors", { include_last_status: true });
+  const glj = j(gl);
+  check("get_errors nodes_in_error_now", Array.isArray(glj.nodes_in_error_now) && glj.nodes_in_error_now.some(x => x.node_id === "n1" && x.fill === "red" && x.text.includes("boom")));
+  check("get_errors last_status_seen recent", Array.isArray(glj.last_status_seen) && glj.last_status_seen.some(x => x.node_id === "n2" && x.fill === "yellow") && glj.last_status_seen.every(x => x.seen_at));
 } catch (e) {
   console.log("FAIL - unexpected:", e.message); failures++;
 } finally {

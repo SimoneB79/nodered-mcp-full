@@ -82,7 +82,7 @@ async function getToken(force) {
 // with the admin token (auth packet), subscribes to status + notification and
 // keeps a rolling buffer of red/yellow node statuses and error notifications.
 const MONITOR_MAX = 500;
-const monitor = { ws: null, state: "idle", since: null, buffer: [], lastFill: new Map(), reconnectMs: 4000, reconnectTimer: null, closedByUs: false };
+const monitor = { ws: null, state: "idle", since: null, buffer: [], lastFill: new Map(), lastStatus: new Map(), reconnectMs: 4000, reconnectTimer: null, closedByUs: false };
 let nodeNames = null; let nodeNamesAt = 0;
 
 function monitorRecord(kind, entry) {
@@ -139,7 +139,14 @@ function monitorConnect() {
       if (topic.indexOf("status/") === 0) {
         const id = topic.slice(7);
         const d = one.data || {};
-        if (d.fill) monitor.lastFill.set(id, d.fill);
+        if (d.fill) {
+          monitor.lastFill.set(id, d.fill);
+          monitor.lastStatus.set(id, { ts: Date.now(), fill: d.fill, shape: d.shape || null, text: String(d.text || "").slice(0, 200) });
+          if (monitor.lastStatus.size > 1000) {
+            const sorted = Array.from(monitor.lastStatus.entries()).sort(function (a, b) { return a[1].ts - b[1].ts; });
+            for (let i = 0; i < 200; i++) monitor.lastStatus.delete(sorted[i][0]);
+          }
+        }
         if (d.fill === "red" || d.fill === "yellow") monitorRecord("status", { node_id: id, fill: d.fill, shape: d.shape || null, text: String(d.text || "") });
         continue;
       }
@@ -505,7 +512,7 @@ function removeNode(flows, nodeId) {
 }
 
 // ---------------- server ----------------
-const server = new McpServer({ name: "nodered-mcp", version: "0.4.0" });
+const server = new McpServer({ name: "nodered-mcp", version: "0.4.1" });
 const log = (msg) => console.error("[nodered-mcp] " + msg);
 log("target " + URL_BASE + (TOKEN ? " (token)" : "") + (READ_ONLY ? " READ-ONLY" : ""));
 
@@ -754,12 +761,13 @@ server.tool("list_node_types", "List installed palette modules and node types", 
   return { content: [{ type: "text", text: txt(nodes.map(m => ({ module: m.module, version: m.version, types: m.types, local: m.local, disabled: m.disabled }))) }] };
 });
 
-server.tool("get_errors", "Live runtime errors and warnings from the Node-RED editor comms channel: node statuses with red/yellow fill (e.g. 'Call-service error...', rejected commands) and runtime error notifications, with node name/type/tab resolved. The monitor connects on first call and keeps a rolling in-memory buffer (reconnects automatically); events are captured from the moment it first connects - there is no history before that. include_warnings:false hides yellow; tab_id filters one tab; clear:true empties the buffer after reading.", {
+server.tool("get_errors", "Live runtime errors and warnings from the Node-RED editor comms channel: node statuses with red/yellow fill (e.g. 'Call-service error...', rejected commands) and runtime error notifications, with node name/type/tab resolved. The monitor connects on first call and keeps a rolling in-memory buffer (reconnects automatically); events are captured from the moment it first connects - there is no history before that. include_warnings:false hides yellow; tab_id filters one tab; clear:true empties the buffer after reading. include_last_status:true adds nodes_in_error_now (nodes whose latest status is red) and last_status_seen (latest status per node seen by the monitor - Node-RED has no status replay: silent nodes show nothing until they emit again).", {
   limit: z.number().int().min(1).max(200).optional(),
   tab_id: z.string().optional(),
   include_warnings: z.boolean().optional(),
-  clear: z.boolean().optional()
-}, async ({ limit, tab_id, include_warnings, clear }) => {
+  clear: z.boolean().optional(),
+  include_last_status: z.boolean().optional()
+}, async ({ limit, tab_id, include_warnings, clear, include_last_status }) => {
   await ensureMonitor();
   const names = await nodeNameMap();
   const wanted = limit || 30;
@@ -781,7 +789,7 @@ server.tool("get_errors", "Live runtime errors and warnings from the Node-RED ed
       tab: info ? info.tab_label : undefined,
       fill: e.fill || undefined,
       level: e.level || undefined,
-      still_current: e.kind === "status" ? monitor.lastFill.get(e.node_id) === e.fill : undefined,
+      still_current: e.kind === "status" ? ((monitor.lastStatus.get(e.node_id) || {}).fill) === e.fill : undefined,
       text: e.text
     });
   }
@@ -790,8 +798,22 @@ server.tool("get_errors", "Live runtime errors and warnings from the Node-RED ed
     monitor: { state: monitor.state, connected_since: monitor.since ? new Date(monitor.since).toISOString() : null, captured_events: monitor.buffer.length },
     errors: entries
   };
+  if (include_last_status) {
+    const seen = [];
+    const nowRed = [];
+    for (const [id, st] of monitor.lastStatus.entries()) {
+      const info = names.map.get(id);
+      if (tab_id && (!info || (info.tab_id !== tab_id && info.tab_label !== tab_id))) continue;
+      const row = { node_id: id, node: info ? info.name : undefined, node_type: info ? info.type : undefined, tab: info ? info.tab_label : undefined, fill: st.fill, shape: st.shape || undefined, text: st.text, seen_at: new Date(st.ts).toISOString() };
+      seen.push(row);
+      if (st.fill === "red") nowRed.push(row);
+    }
+    seen.sort(function (a, b) { return a.seen_at < b.seen_at ? 1 : -1; });
+    out.nodes_in_error_now = nowRed;
+    out.last_status_seen = seen.slice(0, 50);
+  }
   return { content: [{ type: "text", text: txt(out) }] };
 });
 
 await server.connect(new StdioServerTransport());
-log("ready: 18 tools (v0.4.0)");
+log("ready: 18 tools (v0.4.1)");
