@@ -10,11 +10,16 @@ const PORT = 18899;
 const BACKUP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "nr-mcp-test-"));
 
 // ---- mock Node-RED ----
-const flows = [
+const initialFlows = [
   { id: "tab1", type: "tab", label: "Demo" },
-  { id: "n1", type: "inject", z: "tab1", name: "tick" },
-  { id: "n2", type: "debug", z: "tab1", name: "log" }
+  { id: "cfg1", type: "mqtt-broker", name: "Broker LAN" },
+  { id: "n1", type: "inject", z: "tab1", name: "tick", topic: "demo/tick", repeat: "15", once: false, wires: [["n2"]] },
+  { id: "n2", type: "debug", z: "tab1", name: "log", active: true, wires: [] },
+  { id: "n3", type: "mqtt in", z: "tab1", name: "frigate events", topic: "frigate/events", broker: "cfg1", datatype: "json", wires: [["n4"]] },
+  { id: "n4", type: "switch", z: "tab1", name: "route", property: "payload.type", rules: [{ t: "eq", v: "new" }], outputs: 1, wires: [["n5"]] },
+  { id: "n5", type: "function", z: "tab1", name: "parse", func: "const v = parseFloat(msg.payload);\nreturn msg;", outputs: 1, wires: [["n2"]] }
 ];
+const flows = JSON.parse(JSON.stringify(initialFlows));
 let deployed = 0;
 const srv = http.createServer((req, res) => {
   const url = req.url.split("?")[0];
@@ -53,6 +58,9 @@ child.stdout.on("data", d => {
   }
 });
 const call = (method, params) => new Promise(res => { const id = nextId++; pending.set(id, res); child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n"); });
+const tool = (name, args) => call("tools/call", { name, arguments: args });
+const text = (r) => r.result.content[0].text;
+const j = (r) => JSON.parse(text(r));
 
 let failures = 0;
 const check = (name, cond) => { console.log((cond ? "PASS" : "FAIL") + " - " + name); if (!cond) failures++; };
@@ -63,37 +71,97 @@ try {
   child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
 
   const tools = await call("tools/list", {});
-  check("10 tools", tools.result.tools.length === 10);
+  check("17 tools", tools.result.tools.length === 17);
 
-  const lf = await call("tools/call", { name: "list_flows", arguments: {} });
-  const tabs = JSON.parse(lf.result.content[0].text);
-  check("list_flows sees Demo tab", Array.isArray(tabs) && tabs[0].label === "Demo" && tabs[0].nodes === 2);
+  // --- overview + comprehension ---
+  const lf = await tool("list_flows", {});
+  check("list_flows sees Demo tab", Array.isArray(j(lf)) && j(lf)[0].label === "Demo" && j(lf)[0].nodes === 5);
 
-  const st = await call("tools/call", { name: "get_settings", arguments: {} });
-  check("get_settings", JSON.parse(st.result.content[0].text).version === "4.0.0-mock");
+  const lfd = await tool("list_flows", { detail: true });
+  const d0 = j(lfd)[0];
+  check("list_flows detail: entries", d0.entry_points.length === 2 && d0.entry_points.some(e => e.type === "inject" && e.repeat === "15") && d0.entry_points.some(e => e.type === "mqtt in" && e.topic === "frigate/events"));
+  check("list_flows detail: types histogram", d0.types["switch"] === 1 && d0.types["function"] === 1);
+  check("list_flows detail: config refs", JSON.stringify(d0.config_refs).includes("Broker LAN"));
 
-  const ce = await call("tools/call", { name: "call_endpoint", arguments: { path: "/diag" } });
-  check("call_endpoint", ce.result.content[0].text.includes("diag-ok"));
+  const map = await tool("get_flow_map", { tab_id: "tab1" });
+  check("get_flow_map outline: nodes + wiring resolved", text(map).includes("tick") && text(map).includes("frigate events") && text(map).includes("-> log") && text(map).includes("parse"));
+  check("get_flow_map outline: broker inlined", text(map).includes("Broker LAN"));
 
-  const nc = await call("tools/call", { name: "deploy_flows", arguments: { flows: [], confirm: false } });
+  const mm = await tool("get_flow_map", { tab_id: "tab1", format: "mermaid" });
+  check("get_flow_map mermaid", text(mm).includes("flowchart TD") && text(mm).includes("-->"));
+
+  const sn = await tool("search_nodes", { query: "frigate" });
+  check("search_nodes by fields", j(sn).results[0].id === "n3" && j(sn).results[0].topic === "frigate/events");
+  const sc = await tool("search_nodes", { query: "parseFloat" });
+  check("search_nodes in function code", j(sc).code_matches.length === 1 && j(sc).code_matches[0].id === "n5");
+  const snf = await tool("search_nodes", { query: "events", type: "mqtt in" });
+  check("search_nodes type filter", j(snf).results.length === 1);
+
+  const lc = await tool("list_config_nodes", {});
+  const cfg = j(lc).find(c => c.id === "cfg1");
+  check("list_config_nodes with usage", cfg && cfg.users === 1);
+
+  const gn = await tool("get_node", { node_id: "n3", resolve_refs: true });
+  check("get_node resolve_refs", j(gn).refs.broker && j(gn).refs.broker.name === "Broker LAN");
+
+  // --- validation ---
+  const vf = await tool("validate_flows", { flows: [{ id: "x", type: "inject" }, { id: "x", type: "debug" }] });
+  check("validate_flows duplicate id", j(vf).ok === false && JSON.stringify(j(vf).errors).includes("duplicate"));
+  const vw = await tool("validate_flows", { flows: [{ id: "a", type: "server-state-changed", z: "nope", entityidfilter: "binary_sensor.x", wires: [] }] });
+  check("validate_flows v3 field + z warnings", j(vw).warnings.some(w => w.includes("entityidfilter")) && j(vw).warnings.some(w => w.includes("z=nope")));
+
+  // --- writes: dry_run never deploys ---
+  const dr = await tool("patch_node", { node_id: "n1", patch: { name: "tick2" }, dry_run: true });
+  check("patch_node dry_run diff", text(dr).includes("tick2") && deployed === 0);
+
+  const nc = await tool("deploy_flows", { flows: [], confirm: false });
   check("deploy without confirm rejected", nc.result.isError === true);
 
-  const dc = await call("tools/call", { name: "deploy_flows", arguments: { flows: [{ id: "tab9", type: "tab", label: "X" }], confirm: true } });
-  check("deploy with confirm ok", JSON.parse(dc.result.content[0].text).ok === true && deployed === 1);
+  const pn = await tool("patch_node", { node_id: "n1", patch: { name: "tick2" }, confirm: true });
+  check("patch_node applies", j(pn).ok === true && deployed === 1);
+  const gn2 = await tool("get_node", { node_id: "n1" });
+  check("patch_node effect", j(gn2).name === "tick2");
+
+  const pb = await tool("patch_batch", { patches: [{ node_id: "n4", patch: { property: "payload.kind" } }, { node_id: "n2", patch: { name: "logger" } }], confirm: true });
+  check("patch_batch one deploy", j(pb).ok === true && deployed === 2);
+  const gn4 = await tool("get_node", { node_id: "n4" });
+  check("patch_batch effect", j(gn4).property === "payload.kind");
+
+  // --- upsert + wiring ---
+  const up = await tool("upsert_node", { node: { type: "debug", name: "dbg2" }, tab_id: "tab1", confirm: true });
+  check("upsert_node creates", j(up).action === "created" && deployed === 3);
+  const newId2 = j(up).node_id;
+  const gnn = await tool("get_node", { node_id: newId2 });
+  check("upsert_node z + position", j(gnn).z === "tab1" && typeof j(gnn).y === "number");
+  const up2 = await tool("upsert_node", { node: { type: "status", name: "st" }, tab_id: "tab1", wire_from: { node_id: "n1" }, confirm: true });
+  check("upsert_node wire_from", j(up2).action === "created" && deployed === 4);
+  const gn1 = await tool("get_node", { node_id: "n1" });
+  check("wire_from appended", JSON.stringify(j(gn1).wires).includes(j(up2).node_id));
+
+  // --- delete with splice: n3 -> n4 -> n5 becomes n3 -> n5 ---
+  const dn = await tool("delete_node", { node_id: "n4", splice: true, confirm: true });
+  check("delete_node splice", j(dn).ok === true && deployed === 5);
+  const gn3 = await tool("get_node", { node_id: "n3" });
+  check("splice rewired", JSON.stringify(j(gn3).wires) === JSON.stringify([["n5"]]));
+
+  // --- legacy deploy/backup/restore path ---
+  const dc = await tool("deploy_flows", { flows: [{ id: "tab9", type: "tab", label: "X" }], confirm: true });
+  check("deploy with confirm ok", j(dc).ok === true && deployed === 6);
 
   const backups = fs.readdirSync(BACKUP_DIR).filter(f => f.endsWith(".json"));
-  check("backup created", backups.length >= 1);
-
-  const lb = await call("tools/call", { name: "list_backups", arguments: {} });
-  check("list_backups", JSON.parse(lb.result.content[0].text).length >= 1);
-
-  const rb = await call("tools/call", { name: "restore_backup", arguments: { file: backups[0], confirm: true } });
-  check("restore_backup", JSON.parse(rb.result.content[0].text).ok === true && deployed === 2);
-
-  const nd = await call("tools/call", { name: "get_node", arguments: { node_id: "tab1" } });
-  check("get_node (restored state)", JSON.parse(nd.result.content[0].text).label === "Demo");
-  const nt = await call("tools/call", { name: "list_node_types", arguments: {} });
-  check("list_node_types", Array.isArray(JSON.parse(nt.result.content[0].text)) && JSON.parse(nt.result.content[0].text)[0].module === "node-red");
+  check("backups created", backups.length >= 1);
+  const lb = await tool("list_backups", {});
+  check("list_backups", JSON.parse(text(lb)).length >= 1);
+  const rb = await tool("restore_backup", { file: backups[0], confirm: true });
+  check("restore_backup restores initial state", j(rb).ok === true && deployed === 7);
+  const gt = await tool("get_node", { node_id: "tab1" });
+  check("restored label", j(gt).label === "Demo");
+  const st = await tool("get_settings", {});
+  check("get_settings", j(st).version === "4.0.0-mock");
+  const ce = await tool("call_endpoint", { path: "/diag" });
+  check("call_endpoint", text(ce).includes("diag-ok"));
+  const nt = await tool("list_node_types", {});
+  check("list_node_types", j(nt)[0].module === "node-red");
 } catch (e) {
   console.log("FAIL - unexpected:", e.message); failures++;
 } finally {

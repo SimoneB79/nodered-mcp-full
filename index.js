@@ -1,6 +1,13 @@
 #!/usr/bin/env node
 /**
- * nodered-mcp — MCP server for the Node-RED Admin API
+ * nodered-mcp-full - MCP server for the Node-RED Admin API
+ *
+ * v0.3.0 - AI-first flow comprehension layer:
+ *   - get_flow_map: tab/subflow rendered as outline or Mermaid, wiring resolved to names
+ *   - list_flows detail, search_nodes, list_config_nodes
+ *   - surgical writes: patch_batch, upsert_node, delete_node (+splice) - the model
+ *     sends only diffs, the server merges and deploys the full array
+ *   - validation + dry_run diffs on every write tool
  *
  * Generic, environment-driven. Works with:
  *  - direct Node-RED (http/https)
@@ -18,6 +25,7 @@ import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
 
 // ---------------- environment ----------------
 const URL_BASE = (process.env.NODE_RED_URL || "http://localhost:1880").replace(/\/+$/, "");
@@ -87,8 +95,7 @@ async function request(method, urlPath, body, extraHeaders) {
       ca: ca || undefined,
       rejectUnauthorized: !INSECURE_TLS,
     }, (res) => {
-      let data = "";
-      res.setEncoding("utf8");
+      let data = ""; res.setEncoding("utf8");
       res.on("data", (c) => { data += c; });
       res.on("end", () => resolve({ status: res.statusCode, body: data }));
     });
@@ -148,65 +155,468 @@ async function deployFlows(flows) {
 
 function readOnlyError() { return "NODE_RED_READ_ONLY=true: write tools are disabled on this instance."; }
 
+// ---------------- flow comprehension helpers ----------------
+function buildIndex(flows) {
+  const byId = new Map();
+  for (const n of flows) if (n && n.id) byId.set(n.id, n);
+  return byId;
+}
+function shortId(id) { return String(id || "").slice(0, 8); }
+function trunc(s, n) { s = String(s); return s.length <= n ? s : s.slice(0, n - 3) + "..."; }
+function displayName(n) {
+  if (!n) return "?";
+  if (n.name && String(n.name).trim()) return String(n.name).trim();
+  if (n.type === "tab" || n.type === "subflow") return n.label || shortId(n.id);
+  return n.type + ":" + shortId(n.id);
+}
+function isConfigType(t) {
+  return t === "mqtt-broker" || t === "server" || t === "websocket-listener" || t === "websocket-client" || String(t).indexOf("ui_") === 0;
+}
+const ENTRY_TYPES = new Set(["inject", "mqtt in", "http in", "server-state-changed", "link in", "cronplus", "bigtimer", "poll-state", "websocket in", "udp in", "tcp in", "serial in"]);
+const PARAM_SKIP = new Set(["id", "type", "name", "x", "y", "z", "w", "h", "g", "wires", "credentials", "env", "info", "func", "template", "rules", "status", "label", "icon", "order"]);
+
+function paramLine(n, byId) {
+  const out = [];
+  const keys = Object.keys(n);
+  for (let i = 0; i < keys.length && out.length < 8; i++) {
+    const k = keys[i];
+    if (PARAM_SKIP.has(k)) continue;
+    const v = n[k];
+    if (v === "" || v === null || v === undefined || v === false) continue;
+    let s;
+    if (typeof v === "string") { s = byId && byId.has(v) ? displayName(byId.get(v)) + "(" + shortId(v) + ")" : trunc(v, 50); }
+    else if (typeof v === "number" || typeof v === "boolean") { s = String(v); }
+    else { s = trunc(JSON.stringify(v), 50); }
+    out.push(k + "=" + s);
+  }
+  if (typeof n.func === "string") out.push("func=" + n.func.split("\n").length + "L");
+  if (Array.isArray(n.rules)) out.push("rules=" + n.rules.length);
+  return out;
+}
+
+function outlineTab(flows, byId, containerId) {
+  const container = byId.get(containerId);
+  const nodes = flows.filter(function (n) { return n.z === containerId && n.type !== "tab"; });
+  const ids = new Set(nodes.map(function (n) { return n.id; }));
+  const indeg = new Map(); nodes.forEach(function (n) { indeg.set(n.id, 0); });
+  nodes.forEach(function (n) {
+    (n.wires || []).forEach(function (w) { (w || []).forEach(function (t) { if (ids.has(t) && t !== n.id) indeg.set(t, indeg.get(t) + 1); }); });
+  });
+  const depth = new Map();
+  const q = [];
+  nodes.forEach(function (n) { if (indeg.get(n.id) === 0) q.push([n, 0]); });
+  while (q.length) {
+    const it = q.shift(); const n = it[0]; const d = it[1];
+    if (depth.has(n.id)) continue;
+    depth.set(n.id, d);
+    (n.wires || []).forEach(function (w) { (w || []).forEach(function (t) { if (ids.has(t) && !depth.has(t) && t !== n.id) q.push([byId.get(t), d + 1]); }); });
+  }
+  const sorted = nodes.slice().sort(function (a, b) {
+    const da = depth.has(a.id) ? depth.get(a.id) : 99; const db = depth.has(b.id) ? depth.get(b.id) : 99;
+    if (da !== db) return da - db;
+    const ya = a.y || 0, yb = b.y || 0;
+    if (ya !== yb) return ya - yb;
+    return (a.x || 0) - (b.x || 0);
+  });
+  const disabledCount = nodes.filter(function (n) { return n.disabled; }).length;
+  const kind = container && container.type === "subflow" ? "subflow " : "tab ";
+  const lines = ["# " + kind + displayName(container) + " (id " + containerId + ", " + nodes.length + " nodes" + (disabledCount ? ", " + disabledCount + " disabled" : "") + ")"];
+  sorted.forEach(function (n) {
+    const d = depth.has(n.id) ? Math.min(depth.get(n.id), 8) : 0;
+    let label = n.type;
+    if (String(n.type).indexOf("subflow:") === 0) {
+      const def = byId.get(String(n.type).slice(9));
+      label = "subflow " + (def ? displayName(def) : String(n.type).slice(9));
+    }
+    const parts = [shortId(n.id), label];
+    if (n.name) parts.push(JSON.stringify(n.name));
+    if (n.disabled) parts.push("[disabled]");
+    const ps = paramLine(n, byId);
+    if (ps.length) parts.push("| " + ps.join(" "));
+    const outs = [];
+    (n.wires || []).forEach(function (w, i) {
+      const tg = (w || []).map(function (t) {
+        const tn = byId.get(t);
+        if (tn && ids.has(t)) return displayName(tn) + "(" + shortId(t) + ")";
+        if (tn) return "[ext] " + displayName(tn) + " (" + (tn.type === "tab" ? tn.label || "tab" : tn.type) + ")";
+        return "[missing:" + t + "]";
+      });
+      outs.push(((n.wires || []).length > 1 ? "[" + (i + 1) + "] " : "") + "-> " + (tg.join(", ") || "-"));
+    });
+    lines.push("  ".repeat(d) + parts.join(" ") + (outs.length ? " " + outs.join(" ") : ""));
+  });
+  return lines.join("\n");
+}
+
+function mermaidEscape(s) { return String(s).replace(/[\\"[\]"]/g, " ").replace(/[\r\n]+/g, " ").slice(0, 60); }
+function mermaidTab(flows, byId, containerId) {
+  const nodes = flows.filter(function (n) { return n.z === containerId && n.type !== "tab"; });
+  const ids = new Set(nodes.map(function (n) { return n.id; }));
+  const mid = function (n) { return "n" + String(n.id).replace(/[^a-zA-Z0-9_]/g, "_"); };
+  const xid = function (t) { return "x" + String(t).replace(/[^a-zA-Z0-9_]/g, "_"); };
+  const lines = ["flowchart TD"];
+  nodes.forEach(function (n) {
+    let label = n.name ? n.name + " [" + n.type + "]" : n.type;
+    if (String(n.type).indexOf("subflow:") === 0) {
+      const def = byId.get(String(n.type).slice(9));
+      label = (n.name || (def ? displayName(def) : "subflow")) + " [subflow]";
+    }
+    if (n.disabled) label = label + " (disabled)";
+    lines.push("  " + mid(n) + '["' + mermaidEscape(label) + '"]');
+  });
+  const extDefs = new Map();
+  const edges = [];
+  nodes.forEach(function (n) {
+    (n.wires || []).forEach(function (w, i) {
+      (w || []).forEach(function (t) {
+        const tn = byId.get(t);
+        if (tn && ids.has(t)) {
+          edges.push("  " + mid(n) + ((n.wires || []).length > 1 ? " -->|out" + (i + 1) + "| " : " --> ") + mid(tn));
+        } else {
+          const k = xid(t);
+          if (!extDefs.has(k)) {
+            extDefs.set(k, "  " + k + '["' + mermaidEscape(tn ? displayName(tn) + " (" + (tn.type === "tab" ? tn.label || "tab" : tn.type) + ")" : "missing " + String(t).slice(0, 12)) + '"]');
+          }
+          edges.push("  " + mid(n) + " -.-> " + k);
+        }
+      });
+    });
+  });
+  return lines.concat(Array.from(extDefs.values()), edges).join("\n");
+}
+
+function tabSummary(flows, byId, tab, detail) {
+  const nodes = flows.filter(function (n) { return n.z === tab.id && n.type !== "tab"; });
+  const base = { id: tab.id, label: tab.label || tab.id, disabled: !!tab.disabled, nodes: nodes.length, disabled_nodes: nodes.filter(function (n) { return n.disabled; }).length };
+  if (!detail) return base;
+  const types = {};
+  const entries = [];
+  const configs = {};
+  const sub = [];
+  nodes.forEach(function (n) {
+    types[n.type] = (types[n.type] || 0) + 1;
+    if (ENTRY_TYPES.has(n.type)) {
+      const e = { id: n.id, type: n.type, name: n.name || null };
+      ["topic", "url", "method", "repeat", "crontab", "entities", "entity_id", "entity"].forEach(function (k) { if (n[k] !== undefined && n[k] !== "") e[k] = n[k]; });
+      entries.push(e);
+    }
+    if (String(n.type).indexOf("subflow:") === 0) sub.push({ id: n.id, subflow: String(n.type).slice(9), name: n.name || null });
+    Object.keys(n).forEach(function (k) {
+      if (k === "wires" || k === "z" || k === "id") return;
+      const v = n[k];
+      if (typeof v !== "string") return;
+      const t = byId.get(v);
+      if (t && t.type !== "tab" && t.type !== "subflow" && String(t.type).indexOf("subflow:") !== 0 && (t.z === undefined || t.z === null || isConfigType(t.type))) configs[t.id] = displayName(t) + " (" + t.type + ", " + t.id + ")";
+    });
+  });
+  base.types = types;
+  base.entry_points = entries;
+  base.subflow_instances = sub;
+  base.config_refs = Object.values(configs);
+  return base;
+}
+
+function searchNodes(flows, a) {
+  const byId = buildIndex(flows);
+  const q = String(a.query || "").toLowerCase();
+  const limit = a.limit || 30;
+  const results = [];
+  const code = [];
+  flows.forEach(function (n) {
+    if (n.type === "tab") return;
+    if (a.type && n.type !== a.type && !(a.type === "subflow" && String(n.type).indexOf("subflow:") === 0)) return;
+    if (a.tab_id && n.z !== a.tab_id) return;
+    const tabNode = n.z ? byId.get(n.z) : null;
+    const tab = tabNode ? (tabNode.label || tabNode.name || tabNode.id) : (n.z || "config/global");
+    const hay = [n.id, n.type, n.name || "", n.topic || "", n.entity_id || "", n.url || ""].join(" ").toLowerCase();
+    let hit = hay.indexOf(q) >= 0;
+    let snippet = null;
+    if (!hit && typeof n.func === "string") {
+      const low = n.func.toLowerCase(); const i2 = low.indexOf(q);
+      if (i2 >= 0) snippet = trunc(n.func.slice(Math.max(0, i2 - 30), i2 + q.length + 30).replace(/[\r\n]+/g, " "), 90);
+    }
+    if (!hit && snippet === null) return;
+    const item = { id: n.id, type: n.type, name: n.name || null, tab: tab };
+    if (n.topic) item.topic = n.topic;
+    if (n.entity_id) item.entity_id = n.entity_id;
+    if (n.url) item.url = n.url;
+    if (n.disabled) item.disabled = true;
+    item.match = hit ? "fields" : "func";
+    if (snippet !== null) item.snippet = snippet;
+    (hit ? results : code).push(item);
+  });
+  return { query: a.query, matches: results.length + code.length, results: results.slice(0, limit), code_matches: code.slice(0, limit) };
+}
+
+// ---------------- validation + diff ----------------
+function validateFlows(flows) {
+  const errors = []; const warnings = [];
+  if (!Array.isArray(flows)) return { ok: false, errors: ["flows must be an array"], warnings: warnings };
+  const ids = new Set();
+  flows.forEach(function (n) {
+    if (!n || typeof n !== "object") { errors.push("non-object entry in flows array"); return; }
+    if (!n.id) errors.push(String(n.type || "?") + " node missing id");
+    else if (ids.has(n.id)) errors.push("duplicate id " + n.id);
+    else ids.add(n.id);
+    if (!n.type) errors.push("node " + String(n.id) + " missing type");
+  });
+  flows.forEach(function (n) {
+    if (!n || !Array.isArray(n.wires)) return;
+    n.wires.forEach(function (w, i) {
+      if (!Array.isArray(w)) { errors.push(String(n.id) + " wires[" + i + "] is not an array"); return; }
+      (w || []).forEach(function (t) { if (!ids.has(t)) errors.push(String(n.id) + " wires[" + i + "] -> missing target " + String(t)); });
+    });
+  });
+  flows.forEach(function (n) {
+    if (n && n.z && !ids.has(n.z)) warnings.push(String(n.id) + " z=" + n.z + " not a known tab/subflow id (ok for scoped config nodes)");
+  });
+  flows.forEach(function (n) {
+    if (!n || typeof n !== "object") return;
+    if (n.type === "server-state-changed" && n.entityidfilter !== undefined && !n.entities) warnings.push(String(n.id) + " server-state-changed has legacy v3 field entityidfilter - contrib v6 expects entities.entity; the node may never fire");
+    if (typeof n.func === "string" && /flow\.get\([^)]*,\s*["']file["']\)/.test(n.func)) warnings.push(String(n.id) + " function uses flow.get(key, \"file\") - default instances have no file context store; use plain flow.get(key)");
+  });
+  return { ok: errors.length === 0, errors: errors, warnings: warnings };
+}
+
+function nodeDiff(before, after) {
+  const keys = new Set(Object.keys(before || {}));
+  Object.keys(after || {}).forEach(function (k) { keys.add(k); });
+  const out = [];
+  keys.forEach(function (k) {
+    const a = JSON.stringify(before ? before[k] : undefined);
+    const b = JSON.stringify(after ? after[k] : undefined);
+    if (a !== b) out.push(k + ": " + trunc(a, 90) + "  ->  " + trunc(b, 90));
+  });
+  return out;
+}
+
+function newId() { return crypto.randomBytes(8).toString("hex"); }
+function removeNode(flows, nodeId) {
+  return flows.filter(function (n) { return n.id !== nodeId; }).map(function (n) {
+    if (!Array.isArray(n.wires)) return n;
+    const c = Object.assign({}, n);
+    c.wires = n.wires.map(function (w) { return (w || []).filter(function (t) { return t !== nodeId; }); });
+    return c;
+  });
+}
+
 // ---------------- server ----------------
-const server = new McpServer({ name: "nodered-mcp", version: "0.1.0" });
+const server = new McpServer({ name: "nodered-mcp", version: "0.3.0" });
 const log = (msg) => console.error("[nodered-mcp] " + msg);
 log("target " + URL_BASE + (TOKEN ? " (token)" : "") + (READ_ONLY ? " READ-ONLY" : ""));
 
-server.tool("get_settings", "Node-RED runtime settings (version, palette editability, contextStorage) — check limits before advanced work", {}, async () => {
+server.tool("get_settings", "Node-RED runtime settings (version, palette editability, contextStorage) - check limits before advanced work", {}, async () => {
   const s = await apiGetJson("/settings");
   return { content: [{ type: "text", text: txt({ version: s.version, paletteEditable: s.paletteEditable ?? null, contextStorage: s.contextStorage ?? null, httpAdminRoot: s.httpAdminRoot ?? null }) }] };
 });
 
-server.tool("list_flows", "List flow tabs with node counts and disabled flags", {}, async () => {
+server.tool("list_flows", "List flow tabs with node counts. detail:true adds per-tab node-type histogram, entry points (injects + intervals, mqtt topics, http endpoints, HA entities), config refs and subflow instances - the one-call overview of the whole instance.", { detail: z.boolean().optional() }, async ({ detail }) => {
   const flows = await apiGetJson("/flows");
-  const tabs = flows.filter(n => n.type === "tab");
-  const out = tabs.map(t => {
-    const nodes = flows.filter(n => n.z === t.id);
-    return { id: t.id, label: t.label, disabled: t.disabled || false, nodes: nodes.length, subflows: nodes.filter(n => n.type === "subflow").length };
-  });
+  const byId = buildIndex(flows);
+  const tabs = flows.filter(function (n) { return n.type === "tab"; });
+  const out = tabs.map(function (t) { return tabSummary(flows, byId, t, !!detail); });
   return { content: [{ type: "text", text: txt(out) }] };
 });
 
-server.tool("get_flow", "Get nodes of one flow tab (by tab id) or the whole flow document", { tab_id: z.string().optional(), full: z.boolean().optional() }, async ({ tab_id, full }) => {
+server.tool("get_flow_map", "Render one tab or subflow as an AI-readable map - use this FIRST to understand a flow before editing. format=outline (default): indented node lines in execution order, wiring resolved to node names (-> targets), config nodes inlined, functions summarized as line counts. format=mermaid: flowchart diagram. format=json: raw node array.", { tab_id: z.string(), format: z.enum(["outline", "mermaid", "json"]).optional() }, async ({ tab_id, format }) => {
   const flows = await apiGetJson("/flows");
-  if (full || !tab_id) return { content: [{ type: "text", text: txt(flows) }] };
-  const nodes = flows.filter(n => n.z === tab_id);
-  return { content: [{ type: "text", text: txt(nodes) }] };
+  const byId = buildIndex(flows);
+  if (!byId.has(tab_id)) throw new Error("tab/subflow not found: " + tab_id + " (use list_flows for ids)");
+  const f = format || "outline";
+  if (f === "mermaid") return { content: [{ type: "text", text: txt(mermaidTab(flows, byId, tab_id)) }] };
+  if (f === "json") return { content: [{ type: "text", text: txt(flows.filter(function (n) { return n.z === tab_id; })) }] };
+  return { content: [{ type: "text", text: txt(outlineTab(flows, byId, tab_id)) }] };
 });
 
-server.tool("get_node", "Get a single node by id (exact config, function code, wiring)", { node_id: z.string() }, async ({ node_id }) => {
+server.tool("get_flow", "Get nodes of one flow tab (by tab id) or the whole flow document as JSON - for exact patching. compact:true strips x/y/w/h; offset/limit paginate large tabs. For understanding a flow prefer get_flow_map; for finding nodes prefer search_nodes.", {
+  tab_id: z.string().optional(), full: z.boolean().optional(), compact: z.boolean().optional(), offset: z.number().int().optional(), limit: z.number().int().optional()
+}, async ({ tab_id, full, compact, offset, limit }) => {
   const flows = await apiGetJson("/flows");
-  const n = flows.find(x => x.id === node_id);
+  let out = full || !tab_id ? flows : flows.filter(function (n) { return n.z === tab_id; });
+  if (compact) out = out.map(function (n) { const c = Object.assign({}, n); delete c.x; delete c.y; delete c.w; delete c.h; return c; });
+  const total = out.length;
+  if (typeof offset === "number" || typeof limit === "number") {
+    const o = offset || 0;
+    const l = limit || Math.max(total - o, 0);
+    const page = out.slice(o, o + l);
+    return { content: [{ type: "text", text: txt({ total: total, offset: o, count: page.length, nodes: page }) }] };
+  }
+  return { content: [{ type: "text", text: txt(out) }] };
+});
+
+server.tool("get_node", "Get a single node by id (exact config, function code, wiring). resolve_refs:true also inlines the config nodes it references (HA server, mqtt broker...).", { node_id: z.string(), resolve_refs: z.boolean().optional() }, async ({ node_id, resolve_refs }) => {
+  const flows = await apiGetJson("/flows");
+  const n = flows.find(function (x) { return x.id === node_id; });
   if (!n) throw new Error("node not found: " + node_id);
-  return { content: [{ type: "text", text: txt(n) }] };
+  let out = n;
+  if (resolve_refs) {
+    const byId = buildIndex(flows);
+    const refs = {};
+    Object.keys(n).forEach(function (k) {
+      if (k === "wires" || k === "z") return;
+      const v = n[k];
+      if (typeof v === "string" && v !== n.id && byId.has(v)) {
+        const t = byId.get(v);
+        if (t.type !== "tab" && t.type !== "subflow") refs[k] = t;
+      }
+    });
+    out = { node: n, refs: refs };
+  }
+  return { content: [{ type: "text", text: txt(out) }] };
 });
 
-server.tool("patch_node", "Patch one node by id (merge fields: func, wires, name, x, y, ...). Requires confirm:true. Takes automatic backup and deploys the full flow set.", {
-  node_id: z.string(),
-  patch: z.record(z.unknown()),
-  confirm: z.boolean()
-}, async ({ node_id, patch, confirm }) => {
-  if (READ_ONLY) throw new Error(readOnlyError());
-  if (!confirm) throw new Error("pass confirm:true to apply this patch");
+server.tool("search_nodes", "Find nodes by text across name, type, id, topic, entity, url AND function code (code matches returned separately with a snippet). Much cheaper than get_flow when hunting specific nodes. Optional type and tab_id filters; limit default 30.", {
+  query: z.string(), type: z.string().optional(), tab_id: z.string().optional(), limit: z.number().int().optional()
+}, async (a) => {
   const flows = await apiGetJson("/flows");
-  const i = flows.findIndex(x => x.id === node_id);
-  if (i < 0) throw new Error("node not found: " + node_id);
-  flows[i] = Object.assign({}, flows[i], patch);
-  const res = await deployFlows(flows);
-  return { content: [{ type: "text", text: txt(Object.assign({ patched: node_id, fields: Object.keys(patch) }, res)) }] };
+  return { content: [{ type: "text", text: txt(searchNodes(flows, a)) }] };
 });
 
-server.tool("deploy_flows", "Deploy a FULL flow array (the only safe deploy type). Validates it is an array, takes automatic backup first. Requires confirm:true.", {
-  flows: z.array(z.unknown()),
-  confirm: z.boolean(),
-  backup_label: z.string().optional()
-}, async ({ flows, confirm, backup_label }) => {
+server.tool("list_config_nodes", "List config nodes (mqtt brokers, HA servers, dashboard/ui config) with usage counts - who references each one.", {}, async () => {
+  const flows = await apiGetJson("/flows");
+  const byId = buildIndex(flows);
+  const cfgIds = new Set(flows.filter(function (n) {
+    return n.type !== "tab" && n.type !== "subflow" && String(n.type).indexOf("subflow:") !== 0 && (n.z === undefined || n.z === null || isConfigType(n.type));
+  }).map(function (n) { return n.id; }));
+  const users = new Map(); cfgIds.forEach(function (id2) { users.set(id2, 0); });
+  flows.forEach(function (n) {
+    if (cfgIds.has(n.id)) return;
+    Object.keys(n).forEach(function (k) {
+      if (k === "wires" || k === "z" || k === "id") return;
+      const v = n[k];
+      if (typeof v === "string" && cfgIds.has(v)) users.set(v, users.get(v) + 1);
+    });
+  });
+  const out = [];
+  cfgIds.forEach(function (id2) { const n = byId.get(id2); out.push({ id: id2, type: n.type, name: n.name || null, users: users.get(id2) }); });
+  out.sort(function (a, b) { return b.users - a.users; });
+  return { content: [{ type: "text", text: txt(out) }] };
+});
+
+server.tool("patch_node", "Patch ONE node by id (merge fields: func, wires, name, x, y, ...). dry_run:true previews diff + validation without writing. Applying requires confirm:true. Automatic backup + full-array deploy server-side.", {
+  node_id: z.string(), patch: z.record(z.unknown()), confirm: z.boolean().optional(), dry_run: z.boolean().optional()
+}, async ({ node_id, patch, confirm, dry_run }) => {
   if (READ_ONLY) throw new Error(readOnlyError());
-  if (!confirm) throw new Error("pass confirm:true to deploy");
+  const flows = await apiGetJson("/flows");
+  const i = flows.findIndex(function (x) { return x.id === node_id; });
+  if (i < 0) throw new Error("node not found: " + node_id);
+  const merged = Object.assign({}, flows[i], patch);
+  const next = flows.slice(); next[i] = merged;
+  const val = validateFlows(next);
+  if (dry_run) return { content: [{ type: "text", text: txt({ dry_run: true, diff: nodeDiff(flows[i], merged), validation: val }) }] };
+  if (!confirm) throw new Error("pass confirm:true to apply this patch");
+  const res = await deployFlows(next);
+  return { content: [{ type: "text", text: txt(Object.assign({ patched: node_id, fields: Object.keys(patch), validation: val }, res)) }] };
+});
+
+server.tool("patch_batch", "Apply several node patches in ONE deploy: patches=[{node_id, patch}, ...]. Server merges into the full flow set, validates, backs up and deploys once - you never send the whole array. dry_run:true previews all diffs. Applying requires confirm:true.", {
+  patches: z.array(z.object({ node_id: z.string(), patch: z.record(z.unknown()) })), confirm: z.boolean().optional(), dry_run: z.boolean().optional()
+}, async ({ patches, confirm, dry_run }) => {
+  if (READ_ONLY) throw new Error(readOnlyError());
+  if (!Array.isArray(patches) || patches.length === 0) throw new Error("patches must be a non-empty array");
+  const flows = await apiGetJson("/flows");
+  const next = flows.slice();
+  const diffs = [];
+  for (const p of patches) {
+    const i = next.findIndex(function (x) { return x.id === p.node_id; });
+    if (i < 0) throw new Error("node not found: " + p.node_id);
+    const merged = Object.assign({}, next[i], p.patch);
+    diffs.push({ node_id: p.node_id, diff: nodeDiff(next[i], merged) });
+    next[i] = merged;
+  }
+  const val = validateFlows(next);
+  if (dry_run) return { content: [{ type: "text", text: txt({ dry_run: true, diffs: diffs, validation: val }) }] };
+  if (!confirm) throw new Error("pass confirm:true to apply these patches");
+  const res = await deployFlows(next);
+  return { content: [{ type: "text", text: txt(Object.assign({ patched: patches.length + " nodes", diffs: diffs, validation: val }, res)) }] };
+});
+
+server.tool("upsert_node", "Create a new node (auto id, z and position below the tab content) or update an existing one when node.id matches. Optional wire_from {node_id, output} appends this node to that output wire. dry_run:true previews. Applying requires confirm:true. Backup + full deploy server-side.", {
+  node: z.record(z.unknown()), tab_id: z.string().optional(), wire_from: z.object({ node_id: z.string(), output: z.number().int().optional() }).optional(), confirm: z.boolean().optional(), dry_run: z.boolean().optional()
+}, async ({ node, tab_id, wire_from, confirm, dry_run }) => {
+  if (READ_ONLY) throw new Error(readOnlyError());
+  if (!node || typeof node !== "object" || !node.type) throw new Error("node.type is required");
+  const flows = await apiGetJson("/flows");
+  const byId = buildIndex(flows);
+  const exists = node.id && byId.has(node.id);
+  const next = flows.slice();
+  let action; let theNode;
+  if (exists) {
+    const i = next.findIndex(function (x) { return x.id === node.id; });
+    theNode = Object.assign({}, next[i], node);
+    next[i] = theNode; action = "updated";
+  } else {
+    const zid = tab_id || node.z || null;
+    if (!zid) throw new Error("tab_id required for new nodes");
+    if (!byId.has(zid)) throw new Error("tab/subflow not found: " + zid);
+    const inTab = flows.filter(function (n) { return n.z === zid && typeof n.y === "number"; });
+    const maxY = inTab.length ? Math.max.apply(null, inTab.map(function (n) { return n.y; })) : 100;
+    theNode = Object.assign({ id: newId(), x: 100, y: maxY + 100, wires: [] }, node, { z: zid });
+    next.push(theNode); action = "created";
+  }
+  if (wire_from) {
+    const wi = next.findIndex(function (x) { return x.id === wire_from.node_id; });
+    if (wi < 0) throw new Error("wire_from node not found: " + wire_from.node_id);
+    const src = Object.assign({}, next[wi]);
+    if (!Array.isArray(src.wires)) src.wires = [];
+    const o = wire_from.output || 0;
+    while (src.wires.length <= o) src.wires.push([]);
+    src.wires[o] = (src.wires[o] || []).concat([theNode.id]);
+    next[wi] = src;
+  }
+  const val = validateFlows(next);
+  if (dry_run) return { content: [{ type: "text", text: txt({ dry_run: true, action: action, node: theNode, validation: val }) }] };
+  if (!confirm) throw new Error("pass confirm:true to apply");
+  const res = await deployFlows(next);
+  return { content: [{ type: "text", text: txt(Object.assign({ action: action, node_id: theNode.id, validation: val }, res)) }] };
+});
+
+server.tool("delete_node", "Delete one node by id and clean every wire pointing to it. splice:true (single-output nodes only) rewires its inputs directly to its outputs - bypass semantics. dry_run:true previews. Applying requires confirm:true.", {
+  node_id: z.string(), splice: z.boolean().optional(), confirm: z.boolean().optional(), dry_run: z.boolean().optional()
+}, async ({ node_id, splice, confirm, dry_run }) => {
+  if (READ_ONLY) throw new Error(readOnlyError());
+  const flows = await apiGetJson("/flows");
+  const n = flows.find(function (x) { return x.id === node_id; });
+  if (!n) throw new Error("node not found: " + node_id);
+  let next = flows.slice();
+  if (splice) {
+    if ((n.wires || []).length > 1) throw new Error("splice supports single-output nodes only");
+    const outs = (n.wires && n.wires[0]) || [];
+    next = next.map(function (m) {
+      if (!Array.isArray(m.wires)) return m;
+      const c = Object.assign({}, m);
+      c.wires = m.wires.map(function (w) {
+        const ix = (w || []).indexOf(node_id);
+        if (ix < 0) return w;
+        const nw = (w || []).slice();
+        nw.splice.apply(nw, [ix, 1].concat(outs));
+        return nw;
+      });
+      return c;
+    });
+  }
+  next = removeNode(next, node_id);
+  const val = validateFlows(next);
+  if (dry_run) return { content: [{ type: "text", text: txt({ dry_run: true, deleting: n, validation: val }) }] };
+  if (!confirm) throw new Error("pass confirm:true to delete");
+  const res = await deployFlows(next);
+  return { content: [{ type: "text", text: txt(Object.assign({ deleted: node_id, spliced: !!splice, validation: val }, res)) }] };
+});
+
+server.tool("deploy_flows", "Deploy a FULL flow array (the only safe deploy type). Validates it is an array, takes an automatic backup first. dry_run:true validates without deploying. Deploying requires confirm:true.", {
+  flows: z.array(z.unknown()), confirm: z.boolean().optional(), backup_label: z.string().optional(), dry_run: z.boolean().optional()
+}, async ({ flows, confirm, backup_label, dry_run }) => {
+  if (READ_ONLY) throw new Error(readOnlyError());
   if (!Array.isArray(flows)) throw new Error("flows must be an array (the complete flow document)");
+  const val = validateFlows(flows);
+  if (dry_run) return { content: [{ type: "text", text: txt(Object.assign({ dry_run: true, nodes: flows.length }, val)) }] };
+  if (!confirm) throw new Error("pass confirm:true to deploy");
   const res = await deployFlows(flows);
-  return { content: [{ type: "text", text: txt(res) }] };
+  return { content: [{ type: "text", text: txt(Object.assign({ validation: val }, res)) }] };
+});
+
+server.tool("validate_flows", "Validate a candidate full flow array WITHOUT deploying: duplicate ids, dangling wires, unknown z, legacy HA v3 fields on v6 contrib nodes, flow.get(key, \"file\") traps. Run it on any edit built by hand.", { flows: z.array(z.unknown()) }, async ({ flows }) => {
+  return { content: [{ type: "text", text: txt(validateFlows(flows)) }] };
 });
 
 server.tool("call_endpoint", "GET an HTTP endpoint served by Node-RED flows (e.g. custom diagnostic nodes). Path must start with /.", {
@@ -241,4 +651,4 @@ server.tool("list_node_types", "List installed palette modules and node types", 
 });
 
 await server.connect(new StdioServerTransport());
-log("ready: 10 tools");
+log("ready: 17 tools (v0.3.0)");

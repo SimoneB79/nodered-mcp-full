@@ -19,11 +19,18 @@ Built for real-world setups:
 | Tool | Description |
 |------|-------------|
 | `get_settings` | Runtime settings: version, palette editability, contextStorage — check limits first |
-| `list_flows` | All tabs with node counts and disabled flags |
-| `get_flow` | Nodes of one tab (by id), or the whole flow document |
-| `get_node` | Single node by id (full config, function code, wiring) |
-| `patch_node` | Merge fields into one node (func, wires, x/y, ...) — auto backup, needs `confirm:true` |
-| `deploy_flows` | Deploy a complete flow array — auto backup, needs `confirm:true` |
+| `list_flows` | All tabs with node counts; `detail:true` adds type histogram, entry points (injects, mqtt topics, http endpoints, HA entities), config refs, subflow instances |
+| `get_flow_map` | **AI-readable map of one tab/subflow**: `outline` (indented execution order, wiring resolved to names, config nodes inlined), `mermaid` (flowchart), `json` |
+| `get_flow` | Nodes of one tab (by id), or the whole flow document; `compact:true` strips coordinates, `offset`/`limit` paginate |
+| `get_node` | Single node by id (full config, function code, wiring); `resolve_refs:true` inlines referenced config nodes |
+| `search_nodes` | Find nodes by text across name/type/topic/entity/url **and function code** (code matches with snippet) |
+| `list_config_nodes` | Config nodes (brokers, HA servers, ui config) with usage counts |
+| `patch_node` | Merge fields into one node (func, wires, x/y, ...) — `dry_run` preview, auto backup, needs `confirm:true` |
+| `patch_batch` | Many node patches in ONE deploy — server merges + validates + backs up; you send only diffs |
+| `upsert_node` | Create a node (auto id/position, optional `wire_from`) or update by id — needs `confirm:true` |
+| `delete_node` | Delete a node and clean its wires; `splice:true` rewires inputs to outputs — needs `confirm:true` |
+| `validate_flows` | Validate a candidate flow array without deploying (dup ids, dangling wires, legacy HA v3 fields, `flow.get(...,'file')` traps) |
+| `deploy_flows` | Deploy a complete flow array — `dry_run` validation, auto backup, needs `confirm:true` |
 | `call_endpoint` | GET any HTTP endpoint served by your flows (custom diagnostics, APIs) |
 | `list_backups` | List automatic pre-deploy backups |
 | `restore_backup` | Restore a backup in one command — needs `confirm:true` |
