@@ -27,10 +27,20 @@ Built for real-world setups:
 | `list_config_nodes` | Config nodes (brokers, HA servers, ui config) with usage counts |
 | `patch_node` | Merge fields into one node (func, wires, x/y, ...) — `dry_run` preview, auto backup, needs `confirm:true` |
 | `patch_batch` | Many node patches in ONE deploy — server merges + validates + backs up; you send only diffs |
-| `upsert_node` | Create a node (auto id/position, optional `wire_from`) or update by id — needs `confirm:true` |
+| `upsert_node` | Create a node (auto id, position in the first **free canvas region**, optional `wire_from`) or update by id — needs `confirm:true` |
 | `delete_node` | Delete a node and clean its wires; `splice:true` rewires inputs to outputs — needs `confirm:true` |
-| `validate_flows` | Validate a candidate flow array without deploying (dup ids, dangling wires, legacy HA v3 fields, `flow.get(...,'file')` traps) |
-| `deploy_flows` | Deploy a complete flow array — `dry_run` validation, auto backup, needs `confirm:true` |
+| `set_node_enabled` | Enable/disable nodes (`d`) and tabs (`disabled`) without deleting them — batch, one deploy |
+| `bypass_node` | Reroute wires AROUND a node (single-output), keep it on the canvas disabled — non-destructive splice |
+| `validate_flows` | Validate a candidate flow array without deploying (dup ids, dangling wires, broken link targets, legacy HA v3 fields, `flow.get(...,'file')` traps) |
+| `deploy_flows` | Deploy a complete flow array — **revision-guarded**, `dry_run` validation, auto backup, needs `confirm:true` |
+| `manage_tabs` | create / rename / reorder / set_info / delete tabs — delete refuses non-empty tabs without `force` |
+| `manage_groups` | create / add / remove / rename / refit / delete groups — bounds computed from members, single membership |
+| `import_nodes` | Import clipboard-style nodes into a tab — id remap, identical-config reuse, free placement |
+| `export_nodes` | Export nodes + referenced config nodes + subflow defs as clipboard JSON |
+| `layout_audit` | Canvas health per tab: group overlaps/escapes (errors), stray-in-group + estimated node overlaps (warnings) |
+| `arrange_tab` | Repack groups into balanced columns — dry-run plan first, ungrouped nodes never moved |
+| `decouple_tab` | Cross-group wires become link out/in pairs so each group is independently movable |
+| `audit_flows` | Hygiene report: unused configs, empty tabs, orphans, dangling outputs, cross-tab wires, duplicate names |
 | `call_endpoint` | GET any HTTP endpoint served by your flows (custom diagnostics, APIs) |
 | `get_errors` | **Live runtime errors/warnings**: red/yellow node statuses + error notifications from the editor comms channel, node and tab resolved - no SSH needed |
 | `list_backups` | List automatic pre-deploy backups |
@@ -76,6 +86,12 @@ See [`examples/`](examples/) for Claude Desktop, Cursor and the mcp-proxy patter
 ```bash
 docker compose up -d   # uses docker-compose.yml example
 ```
+
+## Safe concurrency & layout (v0.5.0)
+
+- **Revision guard.** Every read captures the flow revision (Admin API v2); every deploy sends it back. If someone deploys from the editor while an edit is in flight, Node-RED answers `409 version_mismatch` and nothing is overwritten — the tool error explains the safe retry. `deploy_flows` accepts `force:true` to overwrite deliberately; `restore_backup` is an explicit rollback and skips the guard by design.
+- **Layout gate.** Every write is checked before/after: edits that would introduce NEW group geometry errors (group-overlap, group-escape) are refused; node footprint checks are estimates and only produce warnings. `allow_overlap:true` on any write tool overrides the gate when an overlap is deliberate.
+- **Free placement.** `upsert_node` and `import_nodes` find the first free canvas region instead of stacking nodes on top of each other.
 
 ## Security notes
 
